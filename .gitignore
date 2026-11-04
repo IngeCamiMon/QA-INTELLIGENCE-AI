@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!frontend/.env.example
+
+# Editors and operating system
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# Logs and generated reports
+*.log
+reports/
+data/
+frontend/node_modules/
+frontend/.next/
