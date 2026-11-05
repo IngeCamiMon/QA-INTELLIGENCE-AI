@@ -82,15 +82,17 @@ En **Especialistas** están disponibles:
 
 ### Automatización web Selenium + Serenity
 
-En **Especialistas → Automatización**, pega la URL local de la aplicación y describe el flujo en lenguaje natural. Si activaste Gemini en **Configuración**, QA Intelligence envía a Google solo esa URL y descripción y genera un borrador de hasta 12 pasos con selectores CSS y aserciones limitadas. No se adjunta código del repositorio. Revisa la suite y confirma antes de ejecutarla.
+En **Especialistas → Automatización**, pega la URL de la aplicación (localhost o un sitio público HTTPS) y describe el flujo en lenguaje natural. Por ejemplo, para `https://sauce-demo.myshopify.com/`, puedes pedir comprobar la carga de la tienda, navegar productos y verificar el carrito usando datos demo. Para mejorar los selectores, QA Intelligence lee la página inicial y Gemini recibe la URL, descripción y un resumen limitado de botones, campos y etiquetas; no se envía el HTML completo ni archivos del repositorio. Revisa el escenario y confirma antes de ejecutarlo; prueba únicamente sitios autorizados, sin completar compras ni introducir datos personales.
 
-La suite usa Selenium WebDriver, Serenity BDD, Cucumber en español y JUnit 4; se guarda dentro de `.qa-automations/` en la carpeta registrada. La ejecución requiere Java 17, Maven, Chrome y conexión a Maven Central para descargar dependencias; estas bibliotecas son gratuitas y de código abierto. El informe Serenity se abre desde la pantalla. Las URLs web se restringen a loopback por seguridad.
+En **Proyectos**, registra una carpeta local donde quieras guardar la suite; puede ser un repositorio de pruebas vacío y no necesita contener el código del sitio remoto. QA Intelligence creará el proyecto Maven dentro de `.qa-automations/` en esa carpeta.
+
+La suite usa Selenium WebDriver, Serenity BDD, Cucumber en español y JUnit 4; se guarda dentro de `.qa-automations/` en la carpeta registrada. La ejecución requiere Java 17, Maven, Chrome y conexión a Maven Central para descargar dependencias; estas bibliotecas son gratuitas y de código abierto. El informe Serenity se abre desde la pantalla. Para sitios externos exige HTTPS y DNS con direcciones públicas, y restringe las acciones automatizadas al mismo origen para bloquear enlaces y formularios a otros dominios.
 
 La integración API admite `GET`, `HEAD`, `POST`, `PUT`, `PATCH` y `DELETE`, estado esperado, cuerpo JSON opcional y una aserción opcional sobre una ruta JSON (por ejemplo `data.estado` igual a `"activo"`). Métodos que pueden modificar datos piden confirmación y se deben ejecutar contra datos locales de prueba. No se persiste el cuerpo enviado, la respuesta ni los valores comparados.
 
 La integración de rendimiento permite configurar hasta 100 solicitudes y 10 conexiones simultáneas a localhost. Es una carga pequeña y limitada, no una prueba de estrés o carga sostenida; k6/JMeter aún no están integrados.
 
-Cada ejecución se guarda en **Ejecuciones** y en la auditoría local. Las integraciones web solo contactan servicios en loopback.
+Cada ejecución se guarda en **Ejecuciones** y en la auditoría local. Las integraciones API y rendimiento solo contactan servicios en loopback; Selenium puede abrir localhost o el sitio HTTPS público que escribiste.
 
 ## Verificación
 

@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import shutil
+import socket
 import subprocess
 import time
 import uuid
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from fastapi import HTTPException
 
@@ -18,34 +23,126 @@ from qa_intelligence import ai_provider
 _ACTIONS = {"navigate", "click", "type", "assert_text", "assert_url"}
 
 
-def validate_local_url(value: str) -> str:
+class _PageControls(HTMLParser):
+    """Extract only a compact list of public interactive selectors, never full page source."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.controls: list[dict] = []
+        self._active: list[int] = []
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key: value or "" for key, value in attrs}
+        if tag == "title":
+            self._in_title = True
+        if tag in {"button", "a", "input", "select", "textarea"} and len(self.controls) < 80:
+            allowed = {key: values[key][:120] for key in
+                       ("id", "class", "name", "type", "placeholder", "aria-label", "data-testid", "role")
+                       if values.get(key)}
+            index = len(self.controls)
+            self.controls.append({"tag": tag, "attributes": allowed, "text": ""})
+            if tag not in {"input", "select", "textarea"}:
+                self._active.append(index)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self._in_title = False
+        if tag in {"button", "a"} and self._active:
+            self._active.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title = (self.title + " " + data.strip())[:160]
+        for index in self._active:
+            self.controls[index]["text"] = (self.controls[index]["text"] + " " + data.strip())[:120]
+
+
+class _SameOriginRedirect(HTTPRedirectHandler):
+    def __init__(self, origin: tuple[str, str, int]):
+        self.origin = origin
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            parsed = urlsplit(validate_web_url(newurl))
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if (parsed.scheme, parsed.hostname, port) != self.origin:
+                return None
+        except (HTTPException, ValueError):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def validate_web_url(value: str) -> str:
     parsed = urlsplit(value.strip())
-    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
-        raise HTTPException(422, "Por seguridad, Selenium solo acepta URLs locales: localhost, 127.0.0.1 o [::1].")
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(422, "Usa una URL http(s) válida.")
     if parsed.username or parsed.password or not parsed.netloc or parsed.query or parsed.fragment:
         raise HTTPException(422, "La URL no debe incluir credenciales, parámetros de consulta ni fragmentos.")
     try:
-        parsed.port
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
     except ValueError as exc:
         raise HTTPException(422, "El puerto de la URL no es válido.") from exc
+    hostname = parsed.hostname.lower().rstrip(".")
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return value.strip()
+    if parsed.scheme != "https":
+        raise HTTPException(422, "Los sitios externos deben usar HTTPS. HTTP se permite solo en localhost.")
+    if hostname.endswith((".localhost", ".local", ".internal", ".test")):
+        raise HTTPException(422, "La URL no debe apuntar a dominios de red privada o de pruebas locales.")
+    try:
+        literal = ipaddress.ip_address(hostname)
+        addresses = {literal}
+    except ValueError:
+        try:
+            addresses = {ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)}
+        except (OSError, ValueError) as exc:
+            raise HTTPException(422, "No se pudo resolver el dominio. Comprueba que sea un sitio público accesible.") from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise HTTPException(422, "La URL externa debe resolver únicamente a direcciones IP públicas.")
     return value.strip()
 
 
+def inspect_public_page(url: str) -> dict:
+    parsed = urlsplit(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    origin = (parsed.scheme, parsed.hostname, port)
+    opener = build_opener(_SameOriginRedirect(origin))
+    request = Request(url, headers={"User-Agent": "QA-Intelligence-AI/0.2", "Accept": "text/html", "Accept-Encoding": "identity"})
+    try:
+        with opener.open(request, timeout=10) as response:
+            if "text/html" not in response.headers.get("Content-Type", "").lower():
+                raise HTTPException(422, "La URL no devolvió una página HTML para inspeccionar.")
+            raw = response.read(1_000_001)
+    except HTTPException:
+        raise
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise HTTPException(502, "No se pudo leer la página HTTPS. Comprueba que sea pública y accesible.") from exc
+    if len(raw) > 1_000_000:
+        raise HTTPException(413, "La página supera el límite de inspección de 1 MB.")
+    page = _PageControls()
+    page.feed(raw.decode("utf-8", errors="replace"))
+    return {"title": page.title, "controls": page.controls}
+
+
 def create_suite(root: Path, project_id: int, url: str, request: str, *, allow_external_ai: bool) -> dict:
-    url = validate_local_url(url)
+    url = validate_web_url(url)
     if not allow_external_ai:
         raise HTTPException(403, "Activa explícitamente Gemini en Configuración para enviar la URL y descripción del caso.")
     if not ai_provider.configured():
         raise HTTPException(503, "Para convertir una descripción libre en pasos, configura Gemini y activa su cuota gratuita.")
+    page_snapshot = inspect_public_page(url)
     generated = ai_provider.generate_json(
-        f"URL de inicio: {url}\nFlujo solicitado: {request}",
+        f"URL de inicio: {url}\nFlujo solicitado: {request}\nEstructura resumida de controles públicos HTML: "
+        f"{json.dumps(page_snapshot, ensure_ascii=False)}",
         system_instruction=(
-            "Convierte la petición QA en un plan de navegador determinista para la URL local dada. "
+            "Convierte la petición QA en un plan de navegador determinista para la URL autorizada dada. "
             "Devuelve entre 1 y 12 pasos. actions permitidas: navigate, click, type, assert_text, assert_url. "
-            "Usa selectores CSS en target para click/type; type lleva el texto en value. assert_text usa "
+            "Elige selectores CSS usando los atributos de controles proporcionados. Usa selectores CSS en target para click/type; type lleva el texto en value. assert_text usa "
             "value como texto visible esperado. assert_url usa value como fragmento esperado de URL. "
-            "Incluye navigate solo para abrir la URL de inicio; nunca uses otra URL, código, JavaScript, "
-            "credenciales ni operaciones de escritura/compra/borrado. Expresa supuestos mediante pasos de aserción."
+            "Incluye navigate solo para abrir la URL de inicio; nunca navegues a otro dominio, uses código, JavaScript, "
+            "credenciales ni operaciones de compra/borrado. Expresa supuestos mediante pasos de aserción."
         ),
         response_schema={"type": "object", "properties": {"steps": {"type": "array", "minItems": 1, "maxItems": 12,
             "items": {"type": "object", "properties": {"action": {"type": "string", "enum": sorted(_ACTIONS)},
@@ -61,7 +158,7 @@ def create_suite(root: Path, project_id: int, url: str, request: str, *, allow_e
         ):
             raise HTTPException(502, "La IA devolvió una acción inválida; no se generó el proyecto.")
         if step["action"] == "navigate" and step["value"] != url:
-            raise HTTPException(502, "La IA intentó navegar fuera de la URL local aprobada.")
+            raise HTTPException(502, "La IA intentó navegar fuera de la URL aprobada.")
         if step["action"] in {"click", "type"} and not step["target"].strip():
             raise HTTPException(502, "La IA devolvió un selector vacío.")
         if step["action"] in {"assert_text", "assert_url"} and not step["value"].strip():
@@ -105,7 +202,7 @@ def run_suite(root: Path, suite_path: str) -> dict:
         raise HTTPException(422, "No se encontró un proyecto de automatización web generado por QA Intelligence.")
     try:
         plan = json.loads((suite / "plan.json").read_text(encoding="utf-8"))
-        url = validate_local_url(plan["url"])
+        url = validate_web_url(plan["url"])
         intact = (
             (suite / "pom.xml").read_text(encoding="utf-8") == _POM
             and (suite / "src/test/java/local/qa/CucumberTest.java").read_text(encoding="utf-8") == _JAVA_RUNNER
@@ -146,16 +243,21 @@ _JAVA_RUNNER = """package local.qa;\nimport net.serenitybdd.cucumber.CucumberWit
 _JAVA_STEPS = r'''package local.qa;
 import io.cucumber.java.es.*;
 import net.serenitybdd.annotations.Managed;
+import org.openqa.selenium.WebElement;
+import org.openqa.selenium.NoSuchElementException;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.support.ui.WebDriverWait;
 import java.time.Duration;
+import java.net.URI;
 import static org.junit.Assert.assertTrue;
 public class WebSteps {
+ private static final String START_URL = __START_URL__;
  @Managed(driver="chrome") WebDriver driver;
- @Dado("que abro la aplicación") public void abrir(){ driver.get(__START_URL__); }
- @Cuando("hago clic en el elemento CSS {string}") public void click(String css){ new WebDriverWait(driver, Duration.ofSeconds(10)).until(d->d.findElement(org.openqa.selenium.By.cssSelector(css)).isDisplayed()).click(); }
+ private boolean sameOrigin(String candidate){ try { URI base=URI.create(START_URL), dest=base.resolve(candidate); int bp=base.getPort()<0?(base.getScheme().equalsIgnoreCase("https")?443:80):base.getPort(), dp=dest.getPort()<0?(dest.getScheme().equalsIgnoreCase("https")?443:80):dest.getPort(); return base.getScheme().equalsIgnoreCase(dest.getScheme()) && base.getHost().equalsIgnoreCase(dest.getHost()) && bp==dp; } catch(Exception e){ return false; } }
+ @Dado("que abro la aplicación") public void abrir(){ driver.get(START_URL); assertTrue("La aplicación redirigió fuera del dominio autorizado", sameOrigin(driver.getCurrentUrl())); }
+ @Cuando("hago clic en el elemento CSS {string}") public void click(String css){ WebElement e=new WebDriverWait(driver, Duration.ofSeconds(10)).until(d->d.findElement(org.openqa.selenium.By.cssSelector(css))); String tag=e.getTagName(); String href=e.getAttribute("href"); if(href!=null && !href.isBlank() && !sameOrigin(href)) throw new AssertionError("Se bloqueó un enlace hacia otro dominio"); if(tag.equalsIgnoreCase("button") || tag.equalsIgnoreCase("input")){ try { String action=e.findElement(org.openqa.selenium.By.xpath("ancestor::form")).getAttribute("action"); if(action!=null && !action.isBlank() && !sameOrigin(action)) throw new AssertionError("Se bloqueó un formulario hacia otro dominio"); } catch(NoSuchElementException ignored){} } e.click(); assertTrue("La navegación salió del dominio autorizado", sameOrigin(driver.getCurrentUrl())); }
  @Cuando("escribo {string} en el elemento CSS {string}") public void escribir(String texto,String css){ var e=new WebDriverWait(driver,Duration.ofSeconds(10)).until(d->d.findElement(org.openqa.selenium.By.cssSelector(css))); e.clear(); e.sendKeys(texto); }
  @Entonces("veo el texto {string}") public void texto(String texto){ assertTrue("No se encontró texto visible: "+texto, new WebDriverWait(driver,Duration.ofSeconds(10)).until(d->d.getPageSource().contains(texto))); }
- @Entonces("la URL contiene {string}") public void url(String fragmento){ assertTrue("La URL no contiene: "+fragmento, driver.getCurrentUrl().contains(fragmento)); }
+ @Entonces("la URL contiene {string}") public void url(String fragmento){ assertTrue("La página salió del dominio autorizado", sameOrigin(driver.getCurrentUrl())); assertTrue("La URL no contiene: "+fragmento, driver.getCurrentUrl().contains(fragmento)); }
 }
 '''

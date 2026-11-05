@@ -73,10 +73,10 @@ export default function Home() {
   useEffect(() => { window.localStorage.setItem("qa-use-external-ai", String(useExternalAi)); }, [useExternalAi]);
   useEffect(() => { if (!message) return; const timer = setTimeout(() => setMessage(""), 5000); return () => clearTimeout(timer); }, [message]);
 
-  async function submit(event: FormEvent<HTMLFormElement>, action: (form: FormData) => Promise<void>) {
+  async function submit(event: FormEvent<HTMLFormElement>, action: (form: FormData) => Promise<void | boolean>) {
     event.preventDefault(); setBusy(true);
     const form = event.currentTarget;
-    try { await action(new FormData(form)); form.reset(); }
+    try { const shouldReset = await action(new FormData(form)); if (shouldReset !== false) form.reset(); }
     catch (error) { setMessage(error instanceof Error ? error.message : "No se pudo completar la acción"); }
     finally { setBusy(false); }
   }
@@ -144,16 +144,18 @@ export default function Home() {
 
   async function generateWebAutomation(form: FormData) {
     if (!projectId) throw new Error("Registra o selecciona un proyecto primero.");
+    if (!window.confirm("Para crear selectores útiles, QA Intelligence leerá la página inicial y enviará a Gemini la URL, tu descripción y un resumen limitado de controles HTML (título, botones y campos). No envía el HTML completo ni archivos del proyecto. Continúa solo si autorizas la prueba de este sitio.")) return false;
     const suite = await api<WebSuite>(`/projects/${projectId}/automations/web/generate`, {
       method: "POST", body: JSON.stringify({ url: form.get("url"), description: form.get("description"), allow_external_ai: useExternalAi }),
     });
     setWebSuite(suite); setWebRun(null);
     setMessage(`Borrador Serenity generado: ${suite.steps} pasos. Revisa el escenario antes de ejecutarlo.`);
+    return true;
   }
 
   async function runWebAutomation() {
     if (!projectId || !webSuite) return;
-    if (!window.confirm("Esto ejecutará la suite Serenity generada en un navegador y descargará dependencias Maven si hace falta. Continúa solo con una URL local que controles.")) return;
+    if (!window.confirm("Esto ejecutará Selenium contra el sitio configurado y puede descargar dependencias Maven. Continúa solo si tienes autorización para probar ese sitio; usa datos demo, no compres ni ingreses datos personales.")) return;
     setBusy(true); setMessage("Ejecutando Selenium + Serenity; puede tardar hasta 3 minutos…");
     try {
       const result = await api<Run>(`/projects/${projectId}/automations/web/run`, { method: "POST", body: JSON.stringify({ suite: webSuite.suite }) });
@@ -221,12 +223,12 @@ export default function Home() {
             return <div className="panel specialist-card" key={specialist.id}>
             <div className="specialist-card-head"><span className="spec-glyph">✳</span><span className={`badge ${specialist.status === "available" ? "ready" : "planned"}`}>{specialist.status === "available" ? "Disponible" : "Planificado"}</span></div>
             <h3>{specialist.name}</h3>
-            <p>{specialist.id === "mobile" ? "Requiere servidor Appium, driver y dispositivo configurados." : specialist.id === "automation" ? "Genera suites Selenium + Serenity desde una URL local y la descripción del flujo." : specialist.status === "available" ? "Capacidad conectada al motor local." : "Integración preparada para una fase futura."}</p>
+            <p>{specialist.id === "mobile" ? "Requiere servidor Appium, driver y dispositivo configurados." : specialist.id === "automation" ? "Genera suites Selenium + Serenity desde localhost o un sitio público HTTPS autorizado." : specialist.status === "available" ? "Capacidad conectada al motor local." : "Integración preparada para una fase futura."}</p>
             <div className="tool-tags">{specialist.tools.map((tool) => <span key={tool}>{tool}</span>)}</div>
             {specialist.id === "automation" && <form className="integration-form" onSubmit={(event) => submit(event, generateWebAutomation)}>
-              <label>URL local de la aplicación<input name="url" type="url" defaultValue="http://127.0.0.1:3000" required/></label>
+              <label>URL de la aplicación<input name="url" type="url" defaultValue="http://127.0.0.1:3000" placeholder="https://tu-sitio-publico.com" required/><small>Acepta localhost o sitios públicos HTTPS, como https://sauce-demo.myshopify.com/. Se inspeccionan controles básicos para ayudar a Gemini a elegir selectores.</small></label>
               <label>¿Qué flujo debe probar?<textarea name="description" placeholder="Abre la página de inicio, entra a iniciar sesión, escribe datos de prueba y valida el mensaje…" minLength={5} maxLength={3000} rows={4} required/></label>
-              <small>Gemini recibe solo la URL y la descripción. Activa el envío externo en Configuración. Se crea una suite Selenium + Serenity + Cucumber + JUnit dentro del proyecto.</small>
+              <small>Gemini recibe la URL, la descripción y un resumen de controles de la página elegida. Activa el envío externo en Configuración. La suite Selenium + Serenity + Cucumber + JUnit se crea en la carpeta local registrada.</small>
               <button className="button quiet full" disabled={busy || !selected || !useExternalAi}>Generar borrador web</button>
             </form>}
             {specialist.id === "automation" && webSuite && <div className="integration-result">
