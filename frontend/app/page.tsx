@@ -7,6 +7,7 @@ type Requirement = { id: number; title: string; body: string };
 type TestCase = { id: number; title: string; technique: string; expected: string };
 type Run = { id: number; status: string; summary: string; output: string; started_at: string };
 type IntegrationResult = Pick<Run, "status" | "summary" | "output">;
+type WebSuite = { suite: string; url: string; steps: number; files: string[]; feature: string };
 type Specialist = { id: string; name: string; status: string; tools: string[] };
 type ChatMessage = { id: number; role: "user" | "assistant"; message: string; created_at: string };
 type AiStatus = { provider: string; model: string | null; configured: boolean; enabled: boolean; free_tier_notice: string | null; data_sent: string };
@@ -43,6 +44,8 @@ export default function Home() {
   const [useExternalAi, setUseExternalAi] = useState(false);
   const [securityReport, setSecurityReport] = useState<SecurityReport | null>(null);
   const [integrationResults, setIntegrationResults] = useState<Record<string, IntegrationResult>>({});
+  const [webSuite, setWebSuite] = useState<WebSuite | null>(null);
+  const [webRun, setWebRun] = useState<IntegrationResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const selected = useMemo(() => overview?.projects.find((p) => p.id === projectId) || null, [overview, projectId]);
@@ -121,12 +124,14 @@ export default function Home() {
 
   async function runIntegration(kind: string, form: FormData) {
     if (!projectId) throw new Error("Registra o selecciona un proyecto antes de ejecutar la integración.");
+    if (kind === "api" && ["POST", "PUT", "PATCH", "DELETE"].includes(String(form.get("method"))) &&
+        !window.confirm("Este método HTTP puede cambiar datos. ¿Confirmas que la URL apunta a un entorno local de pruebas?")) return;
     const payload = kind === "api"
-      ? { url: form.get("url"), method: form.get("method"), expected_status: Number(form.get("expected_status")) }
+      ? { url: form.get("url"), method: form.get("method"), expected_status: Number(form.get("expected_status")), body: form.get("body"), expected_json_path: form.get("expected_json_path"), expected_json_value: form.get("expected_json_value") }
       : kind === "sqlite"
         ? { path: form.get("path") }
         : kind === "performance"
-          ? { url: form.get("url"), iterations: Number(form.get("iterations")) }
+          ? { url: form.get("url"), iterations: Number(form.get("iterations")), concurrency: Number(form.get("concurrency")) }
           : { server_url: form.get("server_url"), platform: form.get("platform"), device_name: form.get("device_name"), app_path: form.get("app_path") };
     const result = await api<IntegrationResult>(`/projects/${projectId}/integrations/${kind}`, {
       method: "POST", body: JSON.stringify(payload),
@@ -135,6 +140,27 @@ export default function Home() {
     await refreshProject(projectId);
     await refresh();
     setMessage(`${result.status === "passed" ? "Correcto" : "Con hallazgos"}: ${result.summary}`);
+  }
+
+  async function generateWebAutomation(form: FormData) {
+    if (!projectId) throw new Error("Registra o selecciona un proyecto primero.");
+    const suite = await api<WebSuite>(`/projects/${projectId}/automations/web/generate`, {
+      method: "POST", body: JSON.stringify({ url: form.get("url"), description: form.get("description"), allow_external_ai: useExternalAi }),
+    });
+    setWebSuite(suite); setWebRun(null);
+    setMessage(`Borrador Serenity generado: ${suite.steps} pasos. Revisa el escenario antes de ejecutarlo.`);
+  }
+
+  async function runWebAutomation() {
+    if (!projectId || !webSuite) return;
+    if (!window.confirm("Esto ejecutará la suite Serenity generada en un navegador y descargará dependencias Maven si hace falta. Continúa solo con una URL local que controles.")) return;
+    setBusy(true); setMessage("Ejecutando Selenium + Serenity; puede tardar hasta 3 minutos…");
+    try {
+      const result = await api<Run>(`/projects/${projectId}/automations/web/run`, { method: "POST", body: JSON.stringify({ suite: webSuite.suite }) });
+      setWebRun(result); await refreshProject(projectId); await refresh();
+      setMessage(`Suite web ${result.status}: ${result.summary}`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "No se pudo ejecutar Serenity"); }
+    finally { setBusy(false); }
   }
 
   async function generate(requirementId: number) {
@@ -165,7 +191,7 @@ export default function Home() {
     </aside>
 
     <section className="main-area">
-      <header className="topbar"><div className="breadcrumb">QA Intelligence AI <span>/</span> <b>{title}</b></div><div className="top-actions"><span className="privacy"><span>●</span> Solo local</span><select aria-label="Proyecto activo" value={projectId ?? ""} onChange={(e) => setProjectId(Number(e.target.value) || null)}><option value="">Seleccionar proyecto</option>{overview?.projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select><div className="avatar">QA</div></div></header>
+      <header className="topbar"><div className="breadcrumb">QA Intelligence AI <span>/</span> <b>{title}</b></div><div className="top-actions"><span className="privacy"><span>●</span> Local-first</span><select aria-label="Proyecto activo" value={projectId ?? ""} onChange={(e) => setProjectId(Number(e.target.value) || null)}><option value="">Seleccionar proyecto</option>{overview?.projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select><div className="avatar">QA</div></div></header>
       <div className="content">
         {message && <div className={`toast ${message.startsWith("API sin") ? "error" : ""}`} role="status">{message}<button onClick={() => setMessage("")}>×</button></div>}
         <div className="page-heading"><div><div className="eyebrow">CENTRO DE INGENIERÍA DE CALIDAD</div><h1>{page === "overview" ? <>Control de calidad<span className="period">.</span></> : title}</h1><p>{page === "overview" ? "Visibilidad de proyectos, cobertura y ejecuciones verificables." : selected ? `${selected.name} · ${selected.root}` : "Registra un proyecto local para comenzar."}</p></div><div className="heading-actions">{selected && <a className="button quiet" href={`${API}/projects/${selected.id}/report.html`} target="_blank" rel="noreferrer">↗ Informe</a>}<button className="button primary" disabled={!selected || busy} onClick={execute}>▷ <span>Ejecutar pruebas</span></button></div></div>
@@ -195,11 +221,26 @@ export default function Home() {
             return <div className="panel specialist-card" key={specialist.id}>
             <div className="specialist-card-head"><span className="spec-glyph">✳</span><span className={`badge ${specialist.status === "available" ? "ready" : "planned"}`}>{specialist.status === "available" ? "Disponible" : "Planificado"}</span></div>
             <h3>{specialist.name}</h3>
-            <p>{specialist.id === "mobile" ? "Requiere servidor Appium, driver y dispositivo configurados." : specialist.status === "available" ? "Capacidad conectada al motor local." : "Integración preparada para una fase futura."}</p>
+            <p>{specialist.id === "mobile" ? "Requiere servidor Appium, driver y dispositivo configurados." : specialist.id === "automation" ? "Genera suites Selenium + Serenity desde una URL local y la descripción del flujo." : specialist.status === "available" ? "Capacidad conectada al motor local." : "Integración preparada para una fase futura."}</p>
             <div className="tool-tags">{specialist.tools.map((tool) => <span key={tool}>{tool}</span>)}</div>
+            {specialist.id === "automation" && <form className="integration-form" onSubmit={(event) => submit(event, generateWebAutomation)}>
+              <label>URL local de la aplicación<input name="url" type="url" defaultValue="http://127.0.0.1:3000" required/></label>
+              <label>¿Qué flujo debe probar?<textarea name="description" placeholder="Abre la página de inicio, entra a iniciar sesión, escribe datos de prueba y valida el mensaje…" minLength={5} maxLength={3000} rows={4} required/></label>
+              <small>Gemini recibe solo la URL y la descripción. Activa el envío externo en Configuración. Se crea una suite Selenium + Serenity + Cucumber + JUnit dentro del proyecto.</small>
+              <button className="button quiet full" disabled={busy || !selected || !useExternalAi}>Generar borrador web</button>
+            </form>}
+            {specialist.id === "automation" && webSuite && <div className="integration-result">
+              <b>Suite generada · {webSuite.steps} pasos</b><small>{webSuite.suite}</small>
+              <details><summary>Revisar escenario Gherkin</summary><pre>{webSuite.feature}</pre></details>
+              <button className="button quiet full" disabled={busy} onClick={runWebAutomation}>Ejecutar Selenium + Serenity</button>
+              {webRun && <><p>{webRun.summary}</p><pre>{webRun.output}</pre><a href={`${API}/projects/${projectId}/automations/web/report?suite=${encodeURIComponent(webSuite.suite)}`} target="_blank" rel="noreferrer">Abrir informe Serenity</a></>}
+            </div>}
             {specialist.id === "api" && <form className="integration-form" onSubmit={(event) => submit(event, (form) => runIntegration("api", form))}>
               <label>URL local<input name="url" type="url" defaultValue="http://127.0.0.1:8000/health" required/></label>
-              <div className="integration-fields"><label>Método<select name="method"><option>GET</option><option>HEAD</option></select></label><label>Estado esperado<input name="expected_status" type="number" defaultValue="200" min="100" max="599" required/></label></div>
+              <div className="integration-fields"><label>Método<select name="method"><option>GET</option><option>HEAD</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label><label>Estado esperado<input name="expected_status" type="number" defaultValue="200" min="100" max="599" required/></label></div>
+              <label>Cuerpo JSON (opcional)<textarea name="body" placeholder='{"campo":"valor"}' rows={3}/></label>
+              <div className="integration-fields"><label>Ruta JSON esperada<input name="expected_json_path" placeholder="data.estado"/></label><label>Valor esperado<input name="expected_json_value" placeholder='"activo" o 2'/></label></div>
+              <small>Solo servicios locales. POST/PUT/PATCH/DELETE pueden modificar datos del servicio; ejecútalos solo contra datos de prueba.</small>
               <button className="button quiet full" disabled={busy || !selected}>Ejecutar prueba API</button>
             </form>}
             {specialist.id === "database" && <form className="integration-form" onSubmit={(event) => submit(event, (form) => runIntegration("sqlite", form))}>
@@ -209,8 +250,8 @@ export default function Home() {
             </form>}
             {specialist.id === "performance" && <form className="integration-form" onSubmit={(event) => submit(event, (form) => runIntegration("performance", form))}>
               <label>URL local<input name="url" type="url" defaultValue="http://127.0.0.1:8000/health" required/></label>
-              <label>Solicitudes secuenciales<input name="iterations" type="number" defaultValue="5" min="1" max="10" required/></label>
-              <small>Prueba ligera de latencia; no genera carga alta.</small>
+              <div className="integration-fields"><label>Total solicitudes<input name="iterations" type="number" defaultValue="25" min="1" max="100" required/></label><label>Concurrencia<input name="concurrency" type="number" defaultValue="5" min="1" max="10" required/></label></div>
+              <small>Carga concurrente limitada a localhost (máximo 100 solicitudes y 10 conexiones).</small>
               <button className="button quiet full" disabled={busy || !selected}>Medir respuesta</button>
             </form>}
             {specialist.id === "mobile" && <form className="integration-form" onSubmit={(event) => submit(event, (form) => runIntegration("mobile", form))}>
@@ -231,7 +272,7 @@ export default function Home() {
           {securityReport && <div className="panel scan-results"><div className="panel-title"><div><h3>Hallazgos del escaneo</h3><p>{securityReport.examined_files} archivos revisados · no se muestran valores secretos</p></div><span className="badge">{securityReport.finding_count} patrones</span></div>{securityReport.findings.map((finding, index) => <div className="defect-row" key={`${finding.file}-${finding.line}-${index}`}><span className={`severity ${finding.severity}`}/><div><b>{finding.rule}</b><small>{finding.file}:{finding.line} · {finding.severity}</small></div></div>)}{!securityReport.findings.length && <p className="muted">No se detectaron patrones en los archivos revisados.</p>}<p className="chat-disclaimer">{securityReport.notice}</p></div>}
         </>}
 
-        {page === "settings" && <div className="section-grid columns"><div className="panel"><div className="panel-title"><div><h3>Privacidad y modelo</h3><p>Elige local o cuota gratuita de Gemini.</p></div></div><div className="setting-row"><span><b>Coordinador activo</b><small>{aiStatus?.configured ? `${aiStatus.provider} · ${aiStatus.model}` : "Reglas locales"}</small></span><span className={`badge ${aiStatus?.configured ? "ready" : "planned"}`}>{aiStatus?.configured ? "Configurado" : "Sin clave"}</span></div><label className="ai-consent"><input type="checkbox" checked={useExternalAi} disabled={!aiStatus?.configured} onChange={(event) => setUseExternalAi(event.target.checked)}/><span><b>Permitir IA externa</b><small>Al activarla, chat y requisitos enviados a análisis/casos se transmitirán a Gemini.</small></span></label><div className="privacy-note"><b>Datos enviados</b><p>{aiStatus?.data_sent || "Solo el texto que elijas enviar. Nunca se adjuntan archivos del repositorio."}</p><p>{aiStatus?.free_tier_notice || "La cuota gratuita tiene límites variables. En ese nivel, Google puede usar el contenido para mejorar sus productos. No actives facturación para mantener el costo en cero."}</p></div><div className="setting-row"><span><b>Repositorio y archivos</b><small>No se envían al proveedor externo.</small></span><span className="badge ready">Privados</span></div></div><div className="panel"><div className="panel-title"><div><h3>Agente y ejecución local</h3><p>Restricciones que se aplican al runner actual.</p></div></div><div className="setting-row"><span><b>Carpetas autorizadas</b><small>Solo carpetas registradas desde Proyectos.</small></span><span className="badge ready">Activa</span></div><div className="setting-row"><span><b>Comando permitido</b><small>pytest, sin shell, hasta 90 segundos.</small></span><span className="badge ready">Limitado</span></div><div className="setting-row"><span><b>Base de datos</b><small>SQLite local para instalación sin servicios.</small></span><span className="badge ready">Activa</span></div></div></div>}
+        {page === "settings" && <div className="section-grid columns"><div className="panel"><div className="panel-title"><div><h3>Privacidad y modelo</h3><p>Elige local o cuota gratuita de Gemini.</p></div></div><div className="setting-row"><span><b>Coordinador activo</b><small>{aiStatus?.configured ? `${aiStatus.provider} · ${aiStatus.model}` : "Reglas locales"}</small></span><span className={`badge ${aiStatus?.configured ? "ready" : "planned"}`}>{aiStatus?.configured ? "Configurado" : "Sin clave"}</span></div><label className="ai-consent"><input type="checkbox" checked={useExternalAi} disabled={!aiStatus?.configured} onChange={(event) => setUseExternalAi(event.target.checked)}/><span><b>Permitir IA externa</b><small>Al activarla, chat, requisitos y descripciones web que envíes se transmitirán a Gemini.</small></span></label><div className="privacy-note"><b>Datos enviados</b><p>{aiStatus?.data_sent || "Solo el texto que elijas enviar. Nunca se adjuntan archivos del repositorio."}</p><p>{aiStatus?.free_tier_notice || "La cuota gratuita tiene límites variables. En ese nivel, Google puede usar el contenido para mejorar sus productos. No actives facturación para mantener el costo en cero."}</p></div><div className="setting-row"><span><b>Repositorio y archivos</b><small>No se envían al proveedor externo.</small></span><span className="badge ready">Privados</span></div></div><div className="panel"><div className="panel-title"><div><h3>Agente y ejecución local</h3><p>Restricciones que se aplican al runner actual.</p></div></div><div className="setting-row"><span><b>Carpetas autorizadas</b><small>Solo carpetas registradas desde Proyectos.</small></span><span className="badge ready">Activa</span></div><div className="setting-row"><span><b>Comando permitido</b><small>pytest y suites Serenity generadas, con límite de tiempo.</small></span><span className="badge ready">Limitado</span></div><div className="setting-row"><span><b>Base de datos</b><small>SQLite local para instalación sin servicios.</small></span><span className="badge ready">Activa</span></div></div></div>}
       </div>
       <footer className="footer"><span>QA Intelligence AI <b>·</b> Ingeniería de calidad, con evidencia</span><span>LOCAL-FIRST <i/> PRIVACIDAD ACTIVA</span></footer>
     </section>

@@ -32,7 +32,7 @@ def status() -> dict:
             "Las solicitudes de esa cuota pueden usarse para mejorar productos de Google. "
             "No configures facturación si quieres mantener el costo en cero."
         ) if enabled else None,
-        "data_sent": "Solo el mensaje o requisito explícitamente enviado; nunca archivos del repositorio.",
+        "data_sent": "Solo el mensaje, requisito, URL local y descripción de caso que elijas enviar; nunca archivos del repositorio.",
     }
 
 

@@ -11,19 +11,20 @@ from contextlib import suppress
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from qa_intelligence import store
 from qa_intelligence import ai_provider
 from qa_intelligence import integrations
+from qa_intelligence import web_automation
 
 router = APIRouter(prefix="/api")
 
 SPECIALISTS = [
     {"id": "functional", "name": "QA funcional", "status": "available", "tools": ["requisitos", "riesgos", "casos", "trazabilidad"]},
-    {"id": "automation", "name": "Automatización", "status": "available", "tools": ["pytest local", "captura de salida", "JUnit XML"]},
-    {"id": "api", "name": "API Testing", "status": "available", "tools": ["HTTP GET/HEAD", "código esperado", "servicios localhost"]},
+    {"id": "automation", "name": "Automatización", "status": "available", "tools": ["pytest", "Selenium", "Serenity BDD", "Cucumber", "JUnit 4"]},
+    {"id": "api", "name": "API Testing", "status": "available", "tools": ["HTTP GET/HEAD/POST/PUT/PATCH/DELETE", "estado esperado", "JSON local"]},
     {"id": "database", "name": "Bases de datos", "status": "available", "tools": ["SQLite", "integridad", "solo lectura"]},
     {"id": "performance", "name": "Rendimiento", "status": "available", "tools": ["latencia", "promedio y p95", "máximo 10 solicitudes"]},
     {"id": "security", "name": "Seguridad autorizada", "status": "available", "tools": ["detección local de secretos", "patrones inseguros"]},
@@ -55,8 +56,11 @@ class ChatInput(BaseModel):
 
 class ApiCheckInput(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
-    method: Literal["GET", "HEAD"] = "GET"
+    method: Literal["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] = "GET"
     expected_status: int = Field(default=200, ge=100, le=599)
+    body: str = Field(default="", max_length=10000)
+    expected_json_path: str = Field(default="", max_length=200)
+    expected_json_value: str = Field(default="", max_length=1000)
 
 
 class SqliteCheckInput(BaseModel):
@@ -65,7 +69,8 @@ class SqliteCheckInput(BaseModel):
 
 class PerformanceCheckInput(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
-    iterations: int = Field(default=5, ge=1, le=10)
+    iterations: int = Field(default=25, ge=1, le=100)
+    concurrency: int = Field(default=5, ge=1, le=10)
 
 
 class MobileCheckInput(BaseModel):
@@ -73,6 +78,16 @@ class MobileCheckInput(BaseModel):
     platform: Literal["android", "ios"]
     device_name: str = Field(min_length=1, max_length=120)
     app_path: str = Field(min_length=1, max_length=500)
+
+
+class WebAutomationInput(BaseModel):
+    url: str = Field(min_length=8, max_length=2048)
+    description: str = Field(min_length=5, max_length=3000)
+    allow_external_ai: bool = False
+
+
+class WebAutomationRunInput(BaseModel):
+    suite: str = Field(min_length=1, max_length=500)
 
 
 def project_or_404(project_id: int) -> dict:
@@ -113,7 +128,8 @@ def overview() -> dict:
             "open_defects": store.one("SELECT COUNT(*) AS n FROM defects WHERE status='open'")["n"],
         },
         "specialists": SPECIALISTS,
-        "capabilities": {"ai_provider": ai["provider"], "external_data_sharing": False,
+        "capabilities": {"ai_provider": ai["provider"], "external_data_sharing": ai["configured"],
+                         "external_data_sharing_requires_explicit_consent": True,
                          "external_ai_configured": ai["configured"],
                          "execution_evidence_required": True},
     }
@@ -149,7 +165,9 @@ def _execute_integration(project_id: int, integration_id: str, action) -> dict:
 def run_api_check(project_id: int, payload: ApiCheckInput) -> dict:
     project_or_404(project_id)
     return _execute_integration(project_id, "api",
-                                lambda: integrations.api_smoke(payload.url, payload.method, payload.expected_status))
+                                lambda: integrations.api_smoke(payload.url, payload.method, payload.expected_status,
+                                                               payload.body, payload.expected_json_path,
+                                                               payload.expected_json_value))
 
 
 @router.post("/projects/{project_id}/integrations/sqlite", status_code=201)
@@ -163,7 +181,7 @@ def run_sqlite_check(project_id: int, payload: SqliteCheckInput) -> dict:
 def run_performance_check(project_id: int, payload: PerformanceCheckInput) -> dict:
     project_or_404(project_id)
     return _execute_integration(project_id, "performance",
-                                lambda: integrations.performance_smoke(payload.url, payload.iterations))
+                                lambda: integrations.performance_smoke(payload.url, payload.iterations, payload.concurrency))
 
 
 @router.post("/projects/{project_id}/integrations/mobile", status_code=201)
@@ -171,6 +189,39 @@ def run_mobile_check(project_id: int, payload: MobileCheckInput) -> dict:
     project = project_or_404(project_id)
     return _execute_integration(project_id, "mobile", lambda: integrations.appium_smoke(
         project["resolved_root"], payload.server_url, payload.platform, payload.device_name, payload.app_path))
+
+
+@router.post("/projects/{project_id}/automations/web/generate", status_code=201)
+def generate_web_automation(project_id: int, payload: WebAutomationInput) -> dict:
+    project = project_or_404(project_id)
+    generated = web_automation.create_suite(project["resolved_root"], project_id, payload.url,
+                                               payload.description.strip(), allow_external_ai=payload.allow_external_ai)
+    store.audit("automation.web.generated", project_id, {"suite": generated["suite"], "steps": generated["steps"]})
+    return generated
+
+
+@router.post("/projects/{project_id}/automations/web/run", status_code=201)
+def run_web_automation(project_id: int, payload: WebAutomationRunInput) -> dict:
+    project = project_or_404(project_id)
+    result = web_automation.run_suite(project["resolved_root"], payload.suite)
+    run_id = store.create(
+        "INSERT INTO runs(project_id, status, command, summary, output) VALUES (?, ?, ?, ?, ?)",
+        (project_id, result["status"], f"serenity:{payload.suite}", result["summary"],
+         json.dumps({"output": result.get("output", ""), "report": result.get("report")}, ensure_ascii=False)),
+    )
+    store.audit("automation.web.executed", project_id, {"run_id": run_id, "status": result["status"]})
+    return {**store.one("SELECT * FROM runs WHERE id=?", (run_id,)), "report": result.get("report")}
+
+
+@router.get("/projects/{project_id}/automations/web/report")
+def web_automation_report(project_id: int, suite: str):
+    root = project_or_404(project_id)["resolved_root"]
+    suite_path = (root / suite).resolve()
+    automation_root = (root / ".qa-automations").resolve()
+    report = suite_path / "target" / "site" / "serenity" / "index.html"
+    if not suite_path.is_relative_to(automation_root) or not report.is_file():
+        raise HTTPException(404, "No se encontró el informe Serenity para esta suite.")
+    return FileResponse(report, media_type="text/html")
 
 
 @router.get("/specialists")

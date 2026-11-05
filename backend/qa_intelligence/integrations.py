@@ -6,6 +6,7 @@ import json
 import sqlite3
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
@@ -27,8 +28,8 @@ def validate_loopback_url(value: str) -> str:
     parsed = urlsplit(value.strip())
     if parsed.scheme not in {"http", "https"} or parsed.hostname not in _LOOPBACK_NAMES:
         raise HTTPException(422, "Por seguridad, la URL debe usar http(s)://localhost, 127.0.0.1 o [::1].")
-    if parsed.username or parsed.password or not parsed.netloc or parsed.query or parsed.fragment:
-        raise HTTPException(422, "La URL no debe incluir credenciales, query ni fragmento.")
+    if parsed.username or parsed.password or not parsed.netloc or parsed.fragment:
+        raise HTTPException(422, "La URL no debe incluir credenciales ni fragmento.")
     try:
         parsed.port
     except ValueError as exc:
@@ -36,34 +37,75 @@ def validate_loopback_url(value: str) -> str:
     return value.strip().rstrip("/")
 
 
-def request_local(url: str, method: str = "GET", timeout: float = 5.0) -> tuple[int, str, int]:
+def _display_url(value: str) -> str:
+    parsed = urlsplit(value)
+    return parsed._replace(query="", fragment="").geturl()
+
+
+def request_local(url: str, method: str = "GET", timeout: float = 5.0, body: bytes | None = None,
+                  response_limit: int = 0) -> tuple[int, str, int, bytes]:
     """Request loopback sin seguir redirects y sin guardar cuerpos potencialmente sensibles."""
     safe_url = validate_loopback_url(url)
-    request = Request(safe_url, method=method, headers={"User-Agent": "QA-Intelligence-AI/0.2"})
+    headers = {"User-Agent": "QA-Intelligence-AI/0.2"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(safe_url, data=body, method=method, headers=headers)
     started = time.perf_counter()
+    response_body = b""
     try:
         response = _OPENER.open(request, timeout=timeout)
     except HTTPError as exc:
         # HTTP errors siguen siendo una respuesta válida para poder compararla con lo esperado.
         status, content_type = exc.code, exc.headers.get("Content-Type", "")
+        if response_limit:
+            response_body = exc.read(response_limit + 1)[:response_limit]
         exc.close()
     except (URLError, TimeoutError, OSError) as exc:
         raise HTTPException(502, f"No se pudo conectar con el servicio local ({type(exc).__name__}).") from exc
     else:
         status, content_type = response.status, response.headers.get("Content-Type", "")
+        if response_limit:
+            response_body = response.read(response_limit + 1)[:response_limit]
         response.close()
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-    return status, content_type, elapsed_ms
+    return status, content_type, elapsed_ms, response_body
 
 
-def api_smoke(url: str, method: str, expected_status: int) -> dict:
-    status, content_type, elapsed_ms = request_local(url, method=method, timeout=8)
-    passed = status == expected_status
+def api_smoke(url: str, method: str, expected_status: int, body: str = "",
+              expected_json_path: str = "", expected_json_value: str = "") -> dict:
+    payload = None
+    if body.strip():
+        try:
+            json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(422, "El cuerpo de la solicitud debe ser JSON válido.") from exc
+        if method in {"GET", "HEAD", "DELETE"}:
+            raise HTTPException(422, f"El método {method} no admite un cuerpo en esta integración.")
+        payload = body.encode("utf-8")
+    if bool(expected_json_path.strip()) != bool(expected_json_value.strip()):
+        raise HTTPException(422, "Para validar JSON, completa tanto la ruta como el valor esperado.")
+    status, content_type, elapsed_ms, response_body = request_local(
+        url, method=method, timeout=8, body=payload, response_limit=1_000_000 if expected_json_path.strip() else 0)
+    json_match = None
+    if expected_json_path.strip():
+        try:
+            expected = json.loads(expected_json_value)
+            actual = json.loads(response_body.decode("utf-8"))
+            for part in expected_json_path.split("."):
+                actual = actual[int(part)] if isinstance(actual, list) else actual[part]
+            json_match = actual == expected
+        except (ValueError, KeyError, TypeError, IndexError, UnicodeDecodeError):
+            json_match = False
+    passed = status == expected_status and json_match is not False
     return {
         "status": "passed" if passed else "failed",
-        "summary": f"{method} respondió HTTP {status}; esperado HTTP {expected_status}.",
-        "output": json.dumps({"url": validate_loopback_url(url), "method": method,
+        "summary": f"{method} respondió HTTP {status}; esperado HTTP {expected_status}." +
+                   (" La aserción JSON coincide." if json_match is True else " La aserción JSON no coincide." if json_match is False else ""),
+        "output": json.dumps({"url": _display_url(validate_loopback_url(url)), "method": method,
                               "http_status": status, "expected_status": expected_status,
+                              "request_body_sent": payload is not None,
+                              "json_path_assertion": expected_json_path.strip() or None,
+                              "json_assertion_passed": json_match,
                               "content_type": content_type, "duration_ms": elapsed_ms}, ensure_ascii=False),
     }
 
@@ -110,26 +152,39 @@ def sqlite_integrity(root: Path, relative_path: str) -> dict:
     }
 
 
-def performance_smoke(url: str, iterations: int) -> dict:
+def performance_smoke(url: str, iterations: int, concurrency: int = 5) -> dict:
     safe_url = validate_loopback_url(url)
     durations: list[float] = []
     statuses: dict[str, int] = {}
     failures = 0
-    for _ in range(iterations):
+
+    def request_once() -> tuple[int, float]:
         try:
-            status, _, elapsed = request_local(safe_url, method="GET", timeout=4)
+            status, _, elapsed, _ = request_local(safe_url, method="GET", timeout=4)
+            return status, elapsed
+        except HTTPException:
+            return 0, 0.0
+
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(request_once) for _ in range(iterations)]
+        for future in as_completed(futures):
+            status, elapsed = future.result()
+            if status == 0:
+                failures += 1
+                continue
             durations.append(elapsed)
             statuses[str(status)] = statuses.get(str(status), 0) + 1
-        except HTTPException:
-            failures += 1
+    wall_seconds = time.perf_counter() - started
     ordered = sorted(durations)
     p95_index = max(0, int(len(ordered) * 0.95 + 0.999) - 1) if ordered else 0
     passed = failures == 0 and len(statuses) == 1 and "200" in statuses
     return {
         "status": "passed" if passed else "failed",
-        "summary": f"{iterations} solicitudes secuenciales: {failures} errores de conexión; promedio {statistics.mean(durations):.1f} ms." if durations else f"No hubo respuestas; {failures} errores de conexión.",
-        "output": json.dumps({"url": safe_url, "iterations": iterations, "sequential": True,
+        "summary": f"{iterations} solicitudes con concurrencia {concurrency}: {failures} errores; promedio {statistics.mean(durations):.1f} ms." if durations else f"No hubo respuestas; {failures} errores de conexión.",
+        "output": json.dumps({"url": _display_url(safe_url), "iterations": iterations, "concurrency": concurrency,
                               "http_statuses": statuses, "connection_errors": failures,
+                              "requests_per_second": round(iterations / wall_seconds, 2) if wall_seconds else None,
                               "average_ms": round(statistics.mean(durations), 2) if durations else None,
                               "p95_ms": ordered[p95_index] if ordered else None,
                               "max_ms": max(durations) if durations else None,
@@ -152,7 +207,7 @@ def appium_smoke(root: Path, server_url: str, platform: str, device_name: str, a
     if (not app.is_file() and not (platform_key == "ios" and app.is_dir())) or app.suffix.lower() not in allowed:
         raise HTTPException(422, f"Selecciona un paquete {', '.join(sorted(allowed))} válido.")
 
-    status_code, _, _ = request_local(f"{safe_server}/status", timeout=5)
+    status_code, _, _, _ = request_local(f"{safe_server}/status", timeout=5)
     if status_code != 200:
         raise HTTPException(502, f"El servidor Appium respondió HTTP {status_code} en /status.")
 

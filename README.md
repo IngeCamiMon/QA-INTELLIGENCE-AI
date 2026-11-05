@@ -75,10 +75,20 @@ La API solo escucha en loopback por defecto y CORS solo permite el dashboard loc
 
 En **Especialistas** están disponibles:
 
-- **API Testing:** ejecuta solicitudes `GET` o `HEAD`, compara el código HTTP esperado y guarda la evidencia. Solo admite `localhost`, `127.0.0.1` o `::1`; no sigue redirecciones ni guarda el cuerpo de la respuesta.
+- **API Testing:** ejecuta solicitudes `GET`, `HEAD`, `POST`, `PUT`, `PATCH` o `DELETE`, compara el estado esperado y opcionalmente valida una ruta JSON. Solo admite `localhost`, `127.0.0.1` o `::1`; no sigue redirecciones ni guarda cuerpos o valores de respuesta.
 - **Bases de datos:** ejecuta `PRAGMA integrity_check` en un archivo `.db`, `.sqlite` o `.sqlite3` dentro del proyecto seleccionado. La conexión abre en solo lectura; los archivos mayores de 100 MB se rechazan.
-- **Rendimiento:** hace entre 1 y 10 solicitudes `GET` secuenciales a una URL local y resume promedio, p95, máximo y códigos HTTP. Es un smoke test de baja carga, no una prueba de estrés ni un sustituto de k6/JMeter.
+- **Rendimiento:** ejecuta hasta 100 solicitudes `GET` concurrentes con máximo 10 conexiones a una URL local y resume latencia promedio, p95, máximo, throughput y estados HTTP. Es una prueba acotada para cargas pequeñas, no sustituye k6/JMeter en estrés o carga sostenida.
 - **Mobile:** si Appium está instalado, configurado con el driver adecuado y tiene emulador/dispositivo disponible, inicia la app Android/iOS, comprueba que pueda leer el árbol UI y cierra la sesión. El APK/IPA debe estar dentro del proyecto registrado. Android requiere UiAutomator2; iOS requiere XCUITest y entorno macOS compatible.
+
+### Automatización web Selenium + Serenity
+
+En **Especialistas → Automatización**, pega la URL local de la aplicación y describe el flujo en lenguaje natural. Si activaste Gemini en **Configuración**, QA Intelligence envía a Google solo esa URL y descripción y genera un borrador de hasta 12 pasos con selectores CSS y aserciones limitadas. No se adjunta código del repositorio. Revisa la suite y confirma antes de ejecutarla.
+
+La suite usa Selenium WebDriver, Serenity BDD, Cucumber en español y JUnit 4; se guarda dentro de `.qa-automations/` en la carpeta registrada. La ejecución requiere Java 17, Maven, Chrome y conexión a Maven Central para descargar dependencias; estas bibliotecas son gratuitas y de código abierto. El informe Serenity se abre desde la pantalla. Las URLs web se restringen a loopback por seguridad.
+
+La integración API admite `GET`, `HEAD`, `POST`, `PUT`, `PATCH` y `DELETE`, estado esperado, cuerpo JSON opcional y una aserción opcional sobre una ruta JSON (por ejemplo `data.estado` igual a `"activo"`). Métodos que pueden modificar datos piden confirmación y se deben ejecutar contra datos locales de prueba. No se persiste el cuerpo enviado, la respuesta ni los valores comparados.
+
+La integración de rendimiento permite configurar hasta 100 solicitudes y 10 conexiones simultáneas a localhost. Es una carga pequeña y limitada, no una prueba de estrés o carga sostenida; k6/JMeter aún no están integrados.
 
 Cada ejecución se guarda en **Ejecuciones** y en la auditoría local. Las integraciones web solo contactan servicios en loopback.
 
@@ -102,8 +112,8 @@ GitHub Actions ejecuta los tests del backend y el build del frontend en cada pus
 | 3. Especialistas QA | Análisis funcional, casos positivos/negativos/límites, ejecución pytest, escaneo de patrones de seguridad, smoke HTTP, integridad SQLite, medición local secuencial e integración de smoke Appium. |
 | 4. Ejecución local | Registro explícito de carpetas, explorador limitado, pytest con timeout, salida, JUnit XML y auditoría. Aislamiento de sistema operativo pendiente. |
 | 5. Plataforma web | Dashboard en español para proyectos, chat QA, requisitos, casos, ejecuciones, defectos, informes, especialistas y privacidad. |
-| 6. Integraciones | GitHub Actions, Gemini opcional, API HTTP local, SQLite y smoke Appium implementados. k6/JMeter, Playwright, Selenium, Cypress, SonarQube y Jenkins siguen pendientes. |
-| 7. Validación integral | Pruebas de API/flujo local, comprobación HTML/secretos, ejecución JUnit y build TypeScript. E2E de navegador, sandbox, seguridad avanzada y rendimiento pendientes. |
+| 6. Integraciones | GitHub Actions, Gemini opcional, API HTTP local, SQLite, smoke Appium y borradores web Selenium/Serenity generados desde URL + descripción. k6/JMeter, Playwright, Cypress, SonarQube y Jenkins siguen pendientes. |
+| 7. Validación integral | pytest existente, integración de suites web Serenity, historial JUnit, informe HTML, auditoría y CI. La suite web nueva aún requiere ejecutar su primera validación en la máquina objetivo; sandbox de sistema operativo, seguridad avanzada y carga sostenida pendientes. |
 
 No se configuran ni activan servicios pagos. Gemini requiere clave local de AI Studio y puede operar dentro de la cuota gratuita disponible; los servicios de base de datos servidor, despliegue web, herramientas móviles, carga y escáneres de seguridad especializados siguen planificados.
 
