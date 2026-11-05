@@ -1,8 +1,8 @@
 # QA Intelligence AI
 
-Plataforma local-first para ingeniería de calidad. Incluye API FastAPI, dashboard Next.js/TypeScript en español, persistencia SQLite, análisis heurístico local de requisitos, generador de escenarios revisables, ejecución opcional de pytest, evidencia JUnit XML, registro de auditoría e informes HTML.
+Plataforma local-first para ingeniería de calidad. Incluye API FastAPI, dashboard Next.js/TypeScript en español, persistencia SQLite, análisis heurístico local de requisitos, generador de escenarios revisables, ejecución opcional de pytest, pruebas de servicios HTTP locales, verificación SQLite de solo lectura, smoke test de baja carga, integración Appium para móvil, evidencia de ejecuciones, registro de auditoría e informes HTML.
 
-El coordinador actual utiliza reglas locales. No hay proveedor externo de IA configurado, no se transmite el código del repositorio y no se presentan recomendaciones como ejecuciones. Los casos generados son borradores que requieren revisión QA.
+El coordinador funciona con reglas locales por defecto o Gemini API si se configura una clave local y se activa el envío externo. No transmite el código del repositorio y distingue recomendaciones de ejecuciones. Los casos generados son borradores que requieren revisión QA.
 
 ## Requisitos
 
@@ -25,7 +25,15 @@ Copy-Item .env.example .env.local
 
 ## Iniciar
 
-Abre dos terminales en la raíz del proyecto.
+Desde PowerShell, en la raíz del proyecto, inicia los dos servicios con un comando:
+
+```powershell
+.\start.ps1
+```
+
+El script abre una ventana para la API y otra para el dashboard, y reutiliza los servicios si ya responden en sus puertos esperados. Para reiniciar instancias que abrió el propio script usa `.\start.ps1 -Restart`. Detén cada servidor con `Ctrl+C` en su ventana.
+
+También puedes iniciarlos manualmente en dos terminales.
 
 Terminal 1, API:
 
@@ -40,7 +48,7 @@ Set-Location frontend
 npm run dev
 ```
 
-Abre `http://localhost:3000`. La documentación de la API queda en `http://127.0.0.1:8000/docs`; el endpoint de salud es `/health`. Detén cada proceso con `Ctrl+C` en su terminal.
+Abre `http://127.0.0.1:3000`. La documentación de la API queda en `http://127.0.0.1:8000/docs`; el endpoint de salud es `/health`.
 
 ## Activar IA externa gratuita (opcional)
 
@@ -48,7 +56,7 @@ La aplicación integra Gemini API mediante Google AI Studio. Los modelos y cuota
 
 1. Copia .env.example como .env en la raíz del proyecto.
 2. Crea una clave en [Google AI Studio](https://aistudio.google.com/apikey) y guárdala únicamente en .env como GEMINI_API_KEY=.... Nunca la pegues en el chat, en el frontend ni en Git.
-3. Conserva AI_PROVIDER=gemini y GEMINI_MODEL=gemini-3.8-flash (modelo mostrado con cuota gratuita en la documentación actual). Reinicia la API.
+3. Conserva AI_PROVIDER=gemini y el modelo gratuito de cuota disponible en tu región, por ejemplo `GEMINI_MODEL=gemini-3.5-flash`. Reinicia la API.
 4. En **Configuración**, activa **Permitir IA externa**. Sin esta selección la aplicación usa reglas locales.
 
 Solo se envía a Gemini el mensaje que escribes o el texto del requisito al pulsar analizar/generar; nunca se adjuntan archivos del repositorio. La respuesta externa queda guardada en el historial local. Si la cuota se agota, se muestra un error y no se cambia silenciosamente a otro proveedor. El nivel gratuito depende de disponibilidad, modelo, región y cuenta; revisa siempre el panel de uso de AI Studio.
@@ -62,6 +70,17 @@ Solo se envía a Gemini el mensaje que escribes o el texto del requisito al puls
 5. Consulta la salida real, JUnit XML, auditoría e informe HTML.
 
 La API solo escucha en loopback por defecto y CORS solo permite el dashboard local. Esta versión aún no implementa cuentas ni autenticación para el servidor; no expongas la API a una red pública. El explorador lee archivos dentro de la carpeta registrada, omite `.git`, `node_modules` y entornos virtuales, y limita la lista a 500 archivos. No guarda secretos en el repositorio.
+
+## Integraciones de QA
+
+En **Especialistas** están disponibles:
+
+- **API Testing:** ejecuta solicitudes `GET` o `HEAD`, compara el código HTTP esperado y guarda la evidencia. Solo admite `localhost`, `127.0.0.1` o `::1`; no sigue redirecciones ni guarda el cuerpo de la respuesta.
+- **Bases de datos:** ejecuta `PRAGMA integrity_check` en un archivo `.db`, `.sqlite` o `.sqlite3` dentro del proyecto seleccionado. La conexión abre en solo lectura; los archivos mayores de 100 MB se rechazan.
+- **Rendimiento:** hace entre 1 y 10 solicitudes `GET` secuenciales a una URL local y resume promedio, p95, máximo y códigos HTTP. Es un smoke test de baja carga, no una prueba de estrés ni un sustituto de k6/JMeter.
+- **Mobile:** si Appium está instalado, configurado con el driver adecuado y tiene emulador/dispositivo disponible, inicia la app Android/iOS, comprueba que pueda leer el árbol UI y cierra la sesión. El APK/IPA debe estar dentro del proyecto registrado. Android requiere UiAutomator2; iOS requiere XCUITest y entorno macOS compatible.
+
+Cada ejecución se guarda en **Ejecuciones** y en la auditoría local. Las integraciones web solo contactan servicios en loopback.
 
 ## Verificación
 
@@ -80,10 +99,10 @@ GitHub Actions ejecuta los tests del backend y el build del frontend en cada pus
 | --- | --- |
 | 1. Fundación | API, entorno virtual, Git, logging, `/health`, pruebas y documentación. |
 | 2. Cerebro IA | Coordinador local o Gemini API de cuota gratuita con selección explícita, análisis, casos QA y memoria conversacional SQLite por proyecto. |
-| 3. Especialistas QA | Análisis funcional, casos positivos/negativos/límites, ejecución pytest y escaneo de patrones de seguridad. API, bases de datos especializadas, carga y mobile siguen planificados. |
+| 3. Especialistas QA | Análisis funcional, casos positivos/negativos/límites, ejecución pytest, escaneo de patrones de seguridad, smoke HTTP, integridad SQLite, medición local secuencial e integración de smoke Appium. |
 | 4. Ejecución local | Registro explícito de carpetas, explorador limitado, pytest con timeout, salida, JUnit XML y auditoría. Aislamiento de sistema operativo pendiente. |
 | 5. Plataforma web | Dashboard en español para proyectos, chat QA, requisitos, casos, ejecuciones, defectos, informes, especialistas y privacidad. |
-| 6. Integraciones | GitHub Actions y proveedor Gemini API gratuito opcional configurados. Playwright, Selenium, Cypress, Appium, k6/JMeter, SonarQube y Jenkins pendientes. |
+| 6. Integraciones | GitHub Actions, Gemini opcional, API HTTP local, SQLite y smoke Appium implementados. k6/JMeter, Playwright, Selenium, Cypress, SonarQube y Jenkins siguen pendientes. |
 | 7. Validación integral | Pruebas de API/flujo local, comprobación HTML/secretos, ejecución JUnit y build TypeScript. E2E de navegador, sandbox, seguridad avanzada y rendimiento pendientes. |
 
 No se configuran ni activan servicios pagos. Gemini requiere clave local de AI Studio y puede operar dentro de la cuota gratuita disponible; los servicios de base de datos servidor, despliegue web, herramientas móviles, carga y escáneres de seguridad especializados siguen planificados.

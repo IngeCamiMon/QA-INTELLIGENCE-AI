@@ -6,6 +6,7 @@ type Project = { id: number; name: string; root: string };
 type Requirement = { id: number; title: string; body: string };
 type TestCase = { id: number; title: string; technique: string; expected: string };
 type Run = { id: number; status: string; summary: string; output: string; started_at: string };
+type IntegrationResult = Pick<Run, "status" | "summary" | "output">;
 type Specialist = { id: string; name: string; status: string; tools: string[] };
 type ChatMessage = { id: number; role: "user" | "assistant"; message: string; created_at: string };
 type AiStatus = { provider: string; model: string | null; configured: boolean; enabled: boolean; free_tier_notice: string | null; data_sent: string };
@@ -41,6 +42,7 @@ export default function Home() {
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
   const [useExternalAi, setUseExternalAi] = useState(false);
   const [securityReport, setSecurityReport] = useState<SecurityReport | null>(null);
+  const [integrationResults, setIntegrationResults] = useState<Record<string, IntegrationResult>>({});
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const selected = useMemo(() => overview?.projects.find((p) => p.id === projectId) || null, [overview, projectId]);
@@ -117,6 +119,24 @@ export default function Home() {
     finally { setBusy(false); }
   }
 
+  async function runIntegration(kind: string, form: FormData) {
+    if (!projectId) throw new Error("Registra o selecciona un proyecto antes de ejecutar la integración.");
+    const payload = kind === "api"
+      ? { url: form.get("url"), method: form.get("method"), expected_status: Number(form.get("expected_status")) }
+      : kind === "sqlite"
+        ? { path: form.get("path") }
+        : kind === "performance"
+          ? { url: form.get("url"), iterations: Number(form.get("iterations")) }
+          : { server_url: form.get("server_url"), platform: form.get("platform"), device_name: form.get("device_name"), app_path: form.get("app_path") };
+    const result = await api<IntegrationResult>(`/projects/${projectId}/integrations/${kind}`, {
+      method: "POST", body: JSON.stringify(payload),
+    });
+    setIntegrationResults((current) => ({ ...current, [kind]: result }));
+    await refreshProject(projectId);
+    await refresh();
+    setMessage(`${result.status === "passed" ? "Correcto" : "Con hallazgos"}: ${result.summary}`);
+  }
+
   async function generate(requirementId: number) {
     if (!projectId) return; setBusy(true);
     try { const result = await api<{ generated: number; method: string }>(`/projects/${projectId}/requirements/${requirementId}/generate-cases?use_external_ai=${useExternalAi}`, { method: "POST" }); await refreshProject(projectId); await refresh(); setMessage(`${result.generated} casos propuestos por ${result.method}; requieren revisión QA.`); }
@@ -168,7 +188,48 @@ export default function Home() {
 
         {page === "reports" && <div className="panel"><div className="panel-title"><div><h3>Informes de calidad</h3><p>Informes HTML con casos propuestos y evidencia real de ejecución.</p></div></div>{selected ? <div className="report-card"><div className="report-icon">▤</div><div><b>Informe de {selected.name}</b><small>Casos: {cases.length} · Ejecuciones observadas: {runs.length} · Defectos: {defects.length}</small></div><a className="button primary" href={`${API}/projects/${selected.id}/report.html`} target="_blank" rel="noreferrer">Abrir informe ↗</a></div> : <Empty title="Selecciona un proyecto" text="El informe se construye a partir del proyecto activo."/>}</div>}
 
-        {page === "specialists" && <><div className="specialist-grid">{overview?.specialists.map((specialist) => <div className="panel specialist-card" key={specialist.id}><div className="specialist-card-head"><span className="spec-glyph">✳</span><span className={`badge ${specialist.status === "available" ? "ready" : "planned"}`}>{specialist.status === "available" ? "Disponible" : "Planificado"}</span></div><h3>{specialist.name}</h3><p>{specialist.status === "available" ? "Capacidad conectada al motor local." : "Integración preparada para una fase futura."}</p><div className="tool-tags">{specialist.tools.map((tool) => <span key={tool}>{tool}</span>)}</div>{specialist.id === "security" && <button className="button quiet full" disabled={busy} onClick={runSecurityScan}>⌕ Escanear patrones locales</button>}</div>)}</div>{securityReport && <div className="panel scan-results"><div className="panel-title"><div><h3>Hallazgos del escaneo</h3><p>{securityReport.examined_files} archivos revisados · no se muestran valores secretos</p></div><span className="badge">{securityReport.finding_count} patrones</span></div>{securityReport.findings.map((finding, index) => <div className="defect-row" key={`${finding.file}-${finding.line}-${index}`}><span className={`severity ${finding.severity}`}/><div><b>{finding.rule}</b><small>{finding.file}:{finding.line} · {finding.severity}</small></div></div>)}{!securityReport.findings.length && <p className="muted">No se detectaron patrones en los archivos revisados.</p>}<p className="chat-disclaimer">{securityReport.notice}</p></div>}</>}
+        {page === "specialists" && <>
+          <div className="specialist-grid">{overview?.specialists.map((specialist) => {
+            const resultKey = specialist.id === "database" ? "sqlite" : specialist.id;
+            const integrationResult = integrationResults[resultKey];
+            return <div className="panel specialist-card" key={specialist.id}>
+            <div className="specialist-card-head"><span className="spec-glyph">✳</span><span className={`badge ${specialist.status === "available" ? "ready" : "planned"}`}>{specialist.status === "available" ? "Disponible" : "Planificado"}</span></div>
+            <h3>{specialist.name}</h3>
+            <p>{specialist.id === "mobile" ? "Requiere servidor Appium, driver y dispositivo configurados." : specialist.status === "available" ? "Capacidad conectada al motor local." : "Integración preparada para una fase futura."}</p>
+            <div className="tool-tags">{specialist.tools.map((tool) => <span key={tool}>{tool}</span>)}</div>
+            {specialist.id === "api" && <form className="integration-form" onSubmit={(event) => submit(event, (form) => runIntegration("api", form))}>
+              <label>URL local<input name="url" type="url" defaultValue="http://127.0.0.1:8000/health" required/></label>
+              <div className="integration-fields"><label>Método<select name="method"><option>GET</option><option>HEAD</option></select></label><label>Estado esperado<input name="expected_status" type="number" defaultValue="200" min="100" max="599" required/></label></div>
+              <button className="button quiet full" disabled={busy || !selected}>Ejecutar prueba API</button>
+            </form>}
+            {specialist.id === "database" && <form className="integration-form" onSubmit={(event) => submit(event, (form) => runIntegration("sqlite", form))}>
+              <label>Ruta relativa<input name="path" placeholder="data/mi-base.sqlite" required/></label>
+              <small>Valida integridad SQLite sin modificarla. El archivo debe estar dentro del proyecto registrado.</small>
+              <button className="button quiet full" disabled={busy || !selected}>Validar base SQLite</button>
+            </form>}
+            {specialist.id === "performance" && <form className="integration-form" onSubmit={(event) => submit(event, (form) => runIntegration("performance", form))}>
+              <label>URL local<input name="url" type="url" defaultValue="http://127.0.0.1:8000/health" required/></label>
+              <label>Solicitudes secuenciales<input name="iterations" type="number" defaultValue="5" min="1" max="10" required/></label>
+              <small>Prueba ligera de latencia; no genera carga alta.</small>
+              <button className="button quiet full" disabled={busy || !selected}>Medir respuesta</button>
+            </form>}
+            {specialist.id === "mobile" && <form className="integration-form" onSubmit={(event) => submit(event, (form) => runIntegration("mobile", form))}>
+              <label>Servidor Appium<input name="server_url" type="url" defaultValue="http://127.0.0.1:4723" required/></label>
+              <div className="integration-fields"><label>Plataforma<select name="platform"><option value="android">Android</option><option value="ios">iOS</option></select></label><label>Dispositivo<input name="device_name" placeholder="emulator-5554" required/></label></div>
+              <label>Paquete relativo<input name="app_path" placeholder="build/app-debug.apk" required/></label>
+              <small>Abre la app, lee el árbol UI y cierra la sesión. Requiere UiAutomator2 o XCUITest.</small>
+              <button className="button quiet full" disabled={busy || !selected}>Ejecutar smoke test móvil</button>
+            </form>}
+            {specialist.id === "security" && <button className="button quiet full" disabled={busy} onClick={runSecurityScan}>⌕ Escanear patrones locales</button>}
+            {integrationResult && <details className="integration-result" open>
+              <summary>{integrationResult.summary}</summary>
+              <pre>{integrationResult.output}</pre>
+            </details>}
+          </div>;
+          })}</div>
+          <p className="integration-safety-note">Las pruebas HTTP y de rendimiento solo aceptan servicios locales. El historial guarda resultados resumidos, sin cuerpos HTTP.</p>
+          {securityReport && <div className="panel scan-results"><div className="panel-title"><div><h3>Hallazgos del escaneo</h3><p>{securityReport.examined_files} archivos revisados · no se muestran valores secretos</p></div><span className="badge">{securityReport.finding_count} patrones</span></div>{securityReport.findings.map((finding, index) => <div className="defect-row" key={`${finding.file}-${finding.line}-${index}`}><span className={`severity ${finding.severity}`}/><div><b>{finding.rule}</b><small>{finding.file}:{finding.line} · {finding.severity}</small></div></div>)}{!securityReport.findings.length && <p className="muted">No se detectaron patrones en los archivos revisados.</p>}<p className="chat-disclaimer">{securityReport.notice}</p></div>}
+        </>}
 
         {page === "settings" && <div className="section-grid columns"><div className="panel"><div className="panel-title"><div><h3>Privacidad y modelo</h3><p>Elige local o cuota gratuita de Gemini.</p></div></div><div className="setting-row"><span><b>Coordinador activo</b><small>{aiStatus?.configured ? `${aiStatus.provider} · ${aiStatus.model}` : "Reglas locales"}</small></span><span className={`badge ${aiStatus?.configured ? "ready" : "planned"}`}>{aiStatus?.configured ? "Configurado" : "Sin clave"}</span></div><label className="ai-consent"><input type="checkbox" checked={useExternalAi} disabled={!aiStatus?.configured} onChange={(event) => setUseExternalAi(event.target.checked)}/><span><b>Permitir IA externa</b><small>Al activarla, chat y requisitos enviados a análisis/casos se transmitirán a Gemini.</small></span></label><div className="privacy-note"><b>Datos enviados</b><p>{aiStatus?.data_sent || "Solo el texto que elijas enviar. Nunca se adjuntan archivos del repositorio."}</p><p>{aiStatus?.free_tier_notice || "La cuota gratuita tiene límites variables. En ese nivel, Google puede usar el contenido para mejorar sus productos. No actives facturación para mantener el costo en cero."}</p></div><div className="setting-row"><span><b>Repositorio y archivos</b><small>No se envían al proveedor externo.</small></span><span className="badge ready">Privados</span></div></div><div className="panel"><div className="panel-title"><div><h3>Agente y ejecución local</h3><p>Restricciones que se aplican al runner actual.</p></div></div><div className="setting-row"><span><b>Carpetas autorizadas</b><small>Solo carpetas registradas desde Proyectos.</small></span><span className="badge ready">Activa</span></div><div className="setting-row"><span><b>Comando permitido</b><small>pytest, sin shell, hasta 90 segundos.</small></span><span className="badge ready">Limitado</span></div><div className="setting-row"><span><b>Base de datos</b><small>SQLite local para instalación sin servicios.</small></span><span className="badge ready">Activa</span></div></div></div>}
       </div>

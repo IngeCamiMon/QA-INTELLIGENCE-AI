@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     ai_provider: str = "local"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-3.5-flash"
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

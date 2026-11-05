@@ -2,11 +2,13 @@
 
 import asyncio
 import html
+import json
 import re
 import tempfile
 import sys
 from pathlib import Path
 from contextlib import suppress
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
@@ -14,17 +16,18 @@ from pydantic import BaseModel, Field
 
 from qa_intelligence import store
 from qa_intelligence import ai_provider
+from qa_intelligence import integrations
 
 router = APIRouter(prefix="/api")
 
 SPECIALISTS = [
     {"id": "functional", "name": "QA funcional", "status": "available", "tools": ["requisitos", "riesgos", "casos", "trazabilidad"]},
     {"id": "automation", "name": "Automatización", "status": "available", "tools": ["pytest local", "captura de salida", "JUnit XML"]},
-    {"id": "api", "name": "API Testing", "status": "planned", "tools": ["REST", "contratos"]},
-    {"id": "database", "name": "Bases de datos", "status": "planned", "tools": ["SQL", "integridad de datos"]},
-    {"id": "performance", "name": "Rendimiento", "status": "planned", "tools": ["k6", "JMeter"]},
+    {"id": "api", "name": "API Testing", "status": "available", "tools": ["HTTP GET/HEAD", "código esperado", "servicios localhost"]},
+    {"id": "database", "name": "Bases de datos", "status": "available", "tools": ["SQLite", "integridad", "solo lectura"]},
+    {"id": "performance", "name": "Rendimiento", "status": "available", "tools": ["latencia", "promedio y p95", "máximo 10 solicitudes"]},
     {"id": "security", "name": "Seguridad autorizada", "status": "available", "tools": ["detección local de secretos", "patrones inseguros"]},
-    {"id": "mobile", "name": "Mobile", "status": "planned", "tools": ["Appium"]},
+    {"id": "mobile", "name": "Mobile", "status": "available", "tools": ["Appium", "Android/iOS", "smoke test de interfaz"]},
     {"id": "devops", "name": "DevOps y calidad", "status": "planned", "tools": ["JUnit XML", "CI/CD"]},
 ]
 
@@ -48,6 +51,28 @@ class DefectInput(BaseModel):
 class ChatInput(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     use_external_ai: bool = False
+
+
+class ApiCheckInput(BaseModel):
+    url: str = Field(min_length=8, max_length=2048)
+    method: Literal["GET", "HEAD"] = "GET"
+    expected_status: int = Field(default=200, ge=100, le=599)
+
+
+class SqliteCheckInput(BaseModel):
+    path: str = Field(min_length=1, max_length=500)
+
+
+class PerformanceCheckInput(BaseModel):
+    url: str = Field(min_length=8, max_length=2048)
+    iterations: int = Field(default=5, ge=1, le=10)
+
+
+class MobileCheckInput(BaseModel):
+    server_url: str = Field(default="http://127.0.0.1:4723", min_length=8, max_length=2048)
+    platform: Literal["android", "ios"]
+    device_name: str = Field(min_length=1, max_length=120)
+    app_path: str = Field(min_length=1, max_length=500)
 
 
 def project_or_404(project_id: int) -> dict:
@@ -97,6 +122,55 @@ def overview() -> dict:
 @router.get("/ai/status")
 def ai_status() -> dict:
     return ai_provider.status()
+
+
+def _save_integration_run(project_id: int, integration_id: str, result: dict) -> dict:
+    run_id = store.create(
+        "INSERT INTO runs(project_id, status, command, summary, output) VALUES (?, ?, ?, ?, ?)",
+        (project_id, result["status"], f"qa-integration:{integration_id}", result["summary"], result["output"]),
+    )
+    store.audit("integration.executed", project_id, {"run_id": run_id, "integration": integration_id,
+                                                       "status": result["status"]})
+    return store.one("SELECT * FROM runs WHERE id=?", (run_id,))
+
+
+def _execute_integration(project_id: int, integration_id: str, action) -> dict:
+    try:
+        result = action()
+    except HTTPException as exc:
+        if exc.status_code in {413, 422}:
+            raise
+        result = {"status": "failed", "summary": str(exc.detail),
+                  "output": json.dumps({"error": str(exc.detail)}, ensure_ascii=False)}
+    return _save_integration_run(project_id, integration_id, result)
+
+
+@router.post("/projects/{project_id}/integrations/api", status_code=201)
+def run_api_check(project_id: int, payload: ApiCheckInput) -> dict:
+    project_or_404(project_id)
+    return _execute_integration(project_id, "api",
+                                lambda: integrations.api_smoke(payload.url, payload.method, payload.expected_status))
+
+
+@router.post("/projects/{project_id}/integrations/sqlite", status_code=201)
+def run_sqlite_check(project_id: int, payload: SqliteCheckInput) -> dict:
+    project = project_or_404(project_id)
+    return _execute_integration(project_id, "sqlite",
+                                lambda: integrations.sqlite_integrity(project["resolved_root"], payload.path))
+
+
+@router.post("/projects/{project_id}/integrations/performance", status_code=201)
+def run_performance_check(project_id: int, payload: PerformanceCheckInput) -> dict:
+    project_or_404(project_id)
+    return _execute_integration(project_id, "performance",
+                                lambda: integrations.performance_smoke(payload.url, payload.iterations))
+
+
+@router.post("/projects/{project_id}/integrations/mobile", status_code=201)
+def run_mobile_check(project_id: int, payload: MobileCheckInput) -> dict:
+    project = project_or_404(project_id)
+    return _execute_integration(project_id, "mobile", lambda: integrations.appium_smoke(
+        project["resolved_root"], payload.server_url, payload.platform, payload.device_name, payload.app_path))
 
 
 @router.get("/specialists")
